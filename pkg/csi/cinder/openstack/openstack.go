@@ -189,38 +189,55 @@ func CreateOpenStackProvider(cloudName string) (IOpenStack, error) {
 		cfg.Metadata.SearchOrder = fmt.Sprintf("%s,%s", metadata.ConfigDriveID, metadata.MetadataID)
 	}
 
-	provider, err := client.NewOpenStackClient(global, "cinder-csi-plugin", userAgentData...)
+	cloud, err := CreateOpenStackProviderFromAuthOpts(global, cfg.BlockStorage)
 	if err != nil {
 		return nil, err
+	}
+
+	if osCloud, ok := cloud.(*OpenStack); ok {
+		osCloud.metadataOpts = cfg.Metadata
+	}
+	OsInstances[cloudName] = cloud
+
+	return OsInstances[cloudName], nil
+}
+
+func CreateOpenStackProviderFromAuthOpts(authOpts *client.AuthOpts, bsOpts BlockStorageOpts) (IOpenStack, error) {
+	if authOpts.UseClouds {
+		if authOpts.CloudsFile != "" {
+			os.Setenv("OS_CLIENT_CONFIG_FILE", authOpts.CloudsFile)
+		}
+		if err := client.ReadClouds(authOpts); err != nil {
+			return nil, fmt.Errorf("failed to read clouds.yaml: %w", err)
+		}
+	}
+
+	provider, err := client.NewOpenStackClient(authOpts, "cinder-csi-plugin", userAgentData...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to authenticate: %w", err)
 	}
 
 	epOpts := gophercloud.EndpointOpts{
-		Region:       global.Region,
-		Availability: global.EndpointType,
+		Region:       authOpts.Region,
+		Availability: authOpts.EndpointType,
 	}
 
-	// Init Nova ServiceClient
 	computeclient, err := openstack.NewComputeV2(provider, epOpts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create Nova v2 client: %w", err)
 	}
 
-	// Init Cinder ServiceClient
 	blockstorageclient, err := openstack.NewBlockStorageV3(provider, epOpts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create Cinder v3 client: %w", err)
 	}
 
-	// Init OpenStack
-	OsInstances[cloudName] = &OpenStack{
+	return &OpenStack{
 		compute:      computeclient,
 		blockstorage: blockstorageclient,
-		bsOpts:       cfg.BlockStorage,
+		bsOpts:       bsOpts,
 		epOpts:       epOpts,
-		metadataOpts: cfg.Metadata,
-	}
-
-	return OsInstances[cloudName], nil
+	}, nil
 }
 
 // GetOpenStackProvider returns Openstack Instance

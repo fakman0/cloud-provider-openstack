@@ -17,6 +17,7 @@ limitations under the License.
 package cinder
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -26,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"k8s.io/cloud-provider-openstack/pkg/client"
 	sharedcsi "k8s.io/cloud-provider-openstack/pkg/csi"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
 	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
@@ -53,6 +55,146 @@ func fakeControllerServerWithMultipleRegions() (*controllerServer, *openstack.Op
 		"region-x": osmockAlt,
 	})
 	return cs, osmock, osmockAlt
+}
+
+func TestGetCloudFromSecrets(t *testing.T) {
+	t.Run("valid credentials", func(t *testing.T) {
+		fakeCs, _ := fakeControllerServer()
+		dynamicCloud := new(openstack.OpenStackMock)
+
+		originalCreate := createOpenStackProviderFromAuthOpts
+		createOpenStackProviderFromAuthOpts = func(authOpts *client.AuthOpts, bsOpts openstack.BlockStorageOpts) (openstack.IOpenStack, error) {
+			if authOpts.AuthURL != "https://keystone.example.com/v3" {
+				t.Fatalf("expected auth URL to be populated, got %q", authOpts.AuthURL)
+			}
+			if authOpts.Username != "admin" {
+				t.Fatalf("expected username to be populated, got %q", authOpts.Username)
+			}
+			if authOpts.Password != "secret" {
+				t.Fatalf("expected password to be populated, got %q", authOpts.Password)
+			}
+			if authOpts.TenantName != "demo" {
+				t.Fatalf("expected project name to be populated, got %q", authOpts.TenantName)
+			}
+			if authOpts.DomainName != "Default" {
+				t.Fatalf("expected domain name to be populated, got %q", authOpts.DomainName)
+			}
+			if bsOpts != (openstack.BlockStorageOpts{}) {
+				t.Fatalf("expected zero-value block storage opts, got %#v", bsOpts)
+			}
+			return dynamicCloud, nil
+		}
+		t.Cleanup(func() {
+			createOpenStackProviderFromAuthOpts = originalCreate
+		})
+
+		cloud, err := fakeCs.getCloudFromSecrets(map[string]string{
+			"os-authURL":     "https://keystone.example.com/v3",
+			"os-userName":    "admin",
+			"os-password":    "secret",
+			"os-projectName": "demo",
+			"os-domainName":  "Default",
+		})
+		if err != nil {
+			t.Fatalf("getCloudFromSecrets returned error: %v", err)
+		}
+
+		assert.Same(t, dynamicCloud, cloud)
+	})
+
+	t.Run("cloud-name fallback", func(t *testing.T) {
+		fakeCs, _, osmockAlt := fakeControllerServerWithMultipleRegions()
+
+		cloud, err := fakeCs.getCloudFromSecrets(map[string]string{"cloud": "region-x"})
+		if err != nil {
+			t.Fatalf("getCloudFromSecrets returned error: %v", err)
+		}
+
+		assert.Same(t, osmockAlt, cloud)
+	})
+
+	t.Run("nil or empty secrets fall back to default cloud", func(t *testing.T) {
+		fakeCs, osmock := fakeControllerServer()
+
+		cloud, err := fakeCs.getCloudFromSecrets(nil)
+		if err != nil {
+			t.Fatalf("getCloudFromSecrets(nil) returned error: %v", err)
+		}
+		assert.Same(t, osmock, cloud)
+
+		cloud, err = fakeCs.getCloudFromSecrets(map[string]string{})
+		if err != nil {
+			t.Fatalf("getCloudFromSecrets(empty) returned error: %v", err)
+		}
+		assert.Same(t, osmock, cloud)
+	})
+
+	t.Run("invalid credentials", func(t *testing.T) {
+		fakeCs, _ := fakeControllerServer()
+
+		_, err := fakeCs.getCloudFromSecrets(map[string]string{
+			"os-authURL":  "https://keystone.example.com/v3",
+			"os-userName": "admin",
+		})
+		if err == nil {
+			t.Fatal("expected getCloudFromSecrets to fail")
+		}
+
+		assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	})
+
+	t.Run("auth failure is unauthenticated", func(t *testing.T) {
+		fakeCs, _ := fakeControllerServer()
+
+		originalCreate := createOpenStackProviderFromAuthOpts
+		createOpenStackProviderFromAuthOpts = func(authOpts *client.AuthOpts, bsOpts openstack.BlockStorageOpts) (openstack.IOpenStack, error) {
+			return nil, fmt.Errorf("authentication failed")
+		}
+		t.Cleanup(func() {
+			createOpenStackProviderFromAuthOpts = originalCreate
+		})
+
+		_, err := fakeCs.getCloudFromSecrets(map[string]string{
+			"os-authURL":     "https://keystone.example.com/v3",
+			"os-userName":    "admin",
+			"os-password":    "secret",
+			"os-projectName": "demo",
+			"os-domainName":  "Default",
+		})
+		if err == nil {
+			t.Fatal("expected getCloudFromSecrets to fail")
+		}
+
+		assert.Equal(t, codes.Unauthenticated, status.Code(err))
+	})
+
+	t.Run("credentials take precedence over cloud selector", func(t *testing.T) {
+		fakeCs, _, osmockAlt := fakeControllerServerWithMultipleRegions()
+		dynamicCloud := new(openstack.OpenStackMock)
+
+		originalCreate := createOpenStackProviderFromAuthOpts
+		createOpenStackProviderFromAuthOpts = func(authOpts *client.AuthOpts, bsOpts openstack.BlockStorageOpts) (openstack.IOpenStack, error) {
+			return dynamicCloud, nil
+		}
+		t.Cleanup(func() {
+			createOpenStackProviderFromAuthOpts = originalCreate
+		})
+
+		cloud, err := fakeCs.getCloudFromSecrets(map[string]string{
+			"cloud":          "region-x",
+			"os-authURL":     "https://keystone.example.com/v3",
+			"os-userName":    "admin",
+			"os-password":    "secret",
+			"os-projectName": "demo",
+			"os-domainName":  "Default",
+		})
+		if err != nil {
+			t.Fatalf("getCloudFromSecrets returned error: %v", err)
+		}
+
+		assert.NotSame(t, osmockAlt, cloud)
+		assert.Same(t, dynamicCloud, cloud)
+	})
 }
 
 // Test CreateVolume
@@ -99,6 +241,60 @@ func TestCreateVolume(t *testing.T) {
 	assert.NotEqual(0, len(actualRes.Volume.VolumeId), "Volume Id is nil")
 	assert.NotNil(actualRes.Volume.AccessibleTopology)
 	assert.Equal(FakeAvailability, actualRes.Volume.AccessibleTopology[0].GetSegments()[topologyKey])
+}
+
+func TestCreateVolumeWithSecretBasedCredentials(t *testing.T) {
+	fakeCs, _ := fakeControllerServer()
+	dynamicCloud := new(openstack.OpenStackMock)
+
+	originalCreate := createOpenStackProviderFromAuthOpts
+	createOpenStackProviderFromAuthOpts = func(authOpts *client.AuthOpts, bsOpts openstack.BlockStorageOpts) (openstack.IOpenStack, error) {
+		if authOpts.AuthURL != "https://keystone.example.com/v3" {
+			t.Fatalf("expected auth URL to be populated, got %q", authOpts.AuthURL)
+		}
+		return dynamicCloud, nil
+	}
+	t.Cleanup(func() {
+		createOpenStackProviderFromAuthOpts = originalCreate
+	})
+
+	properties := map[string]string{cinderCSIClusterIDKey: FakeCluster}
+	dynamicCloud.On("CreateVolume", FakeVolName, mock.AnythingOfType("int"), FakeVolType, FakeAvailability, "", "", "", properties).Return(&FakeVol, nil)
+	dynamicCloud.On("GetVolumesByName", FakeVolName).Return(FakeVolListEmpty, nil)
+	dynamicCloud.On("GetBlockStorageOpts").Return(openstack.BlockStorageOpts{})
+
+	fakeReq := &csi.CreateVolumeRequest{
+		Name: FakeVolName,
+		Secrets: map[string]string{
+			"os-authURL":     "https://keystone.example.com/v3",
+			"os-userName":    "admin",
+			"os-password":    "secret",
+			"os-projectName": "demo",
+			"os-domainName":  "Default",
+		},
+		VolumeCapabilities: []*csi.VolumeCapability{
+			{
+				AccessMode: &csi.VolumeCapability_AccessMode{
+					Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				},
+			},
+		},
+		AccessibilityRequirements: &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{
+					Segments: map[string]string{topologyKey: FakeAvailability},
+				},
+			},
+		},
+	}
+
+	actualRes, err := fakeCs.CreateVolume(FakeCtx, fakeReq)
+	if err != nil {
+		t.Fatalf("CreateVolume returned error: %v", err)
+	}
+
+	assert.NotNil(t, actualRes.Volume)
+	assert.Equal(t, FakeVolID, actualRes.Volume.VolumeId)
 }
 
 // Test CreateVolume fails with quota exceeded error

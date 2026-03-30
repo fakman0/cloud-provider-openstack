@@ -36,6 +36,7 @@ import (
 
 	sharedcsi "k8s.io/cloud-provider-openstack/pkg/csi"
 	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/openstack"
+	"k8s.io/cloud-provider-openstack/pkg/csi/cinder/options"
 	"k8s.io/cloud-provider-openstack/pkg/util"
 	cpoerrors "k8s.io/cloud-provider-openstack/pkg/util/errors"
 	"k8s.io/klog/v2"
@@ -53,14 +54,53 @@ const (
 	antiAffinityKey       = "cinder.csi.openstack.org/anti-affinity"
 )
 
+var (
+	newOpenstackOptions                 = options.NewOpenstackOptions
+	createOpenStackProviderFromAuthOpts = openstack.CreateOpenStackProviderFromAuthOpts
+)
+
+func (cs *controllerServer) getCloudFromSecrets(secrets map[string]string) (openstack.IOpenStack, error) {
+	_, hasAuthURL := secrets["os-authURL"]
+	_, hasUseClouds := secrets["os-useClouds"]
+	if hasAuthURL || hasUseClouds {
+		if _, hasCloudSelector := secrets["cloud"]; hasCloudSelector {
+			klog.Warning("OpenStack CSI request secrets take precedence over the legacy \"cloud\" selector secret")
+		}
+
+		authOpts, err := newOpenstackOptions(secrets)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid OpenStack secrets: %v", err)
+		}
+
+		// Per-request CSI secrets currently carry auth details only. Block storage
+		// settings continue to come from cloud.conf, so dynamic clients use defaults.
+		cloud, err := createOpenStackProviderFromAuthOpts(authOpts, openstack.BlockStorageOpts{})
+		if err != nil {
+			return nil, status.Errorf(codes.Unauthenticated, "failed to create OpenStack client from CSI request secrets: %v", err)
+		}
+
+		return cloud, nil
+	}
+
+	cloudName := ""
+	if secrets != nil {
+		cloudName = secrets["cloud"]
+	}
+
+	cloud, cloudExist := cs.Clouds[cloudName]
+	if !cloudExist {
+		return nil, status.Errorf(codes.InvalidArgument, "specified cloud %q undefined", cloudName)
+	}
+
+	return cloud, nil
+}
+
 func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	klog.V(4).Infof("CreateVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[CreateVolume] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	// Volume Name
@@ -261,11 +301,9 @@ func (d *controllerServer) ControllerModifyVolume(ctx context.Context, req *csi.
 func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	klog.V(4).Infof("DeleteVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Errorf(codes.InvalidArgument, "[DeleteVolume] specified cloud \"%s\" undefined", volCloud)
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	// Volume Delete
@@ -273,7 +311,7 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	if len(volID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "DeleteVolume Volume ID must be provided")
 	}
-	err := cloud.DeleteVolume(ctx, volID)
+	err = cloud.DeleteVolume(ctx, volID)
 	if err != nil {
 		if cpoerrors.IsNotFound(err) {
 			klog.V(3).Infof("Volume %s is already deleted.", volID)
@@ -291,11 +329,9 @@ func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
 	klog.V(4).Infof("ControllerPublishVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[ControllerPublishVolume] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	// Volume Attach
@@ -313,7 +349,7 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 		return nil, status.Error(codes.InvalidArgument, "[ControllerPublishVolume] Volume capability must be provided")
 	}
 
-	_, err := cloud.GetVolume(ctx, volumeID)
+	_, err = cloud.GetVolume(ctx, volumeID)
 	if err != nil {
 		if cpoerrors.IsNotFound(err) {
 			return nil, status.Errorf(codes.NotFound, "[ControllerPublishVolume] Volume %s not found", volumeID)
@@ -362,11 +398,9 @@ func (cs *controllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
 	klog.V(4).Infof("ControllerUnpublishVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[ControllerUnpublishVolume] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	// Volume Detach
@@ -376,7 +410,7 @@ func (cs *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "[ControllerUnpublishVolume] Volume ID must be provided")
 	}
-	_, err := cloud.GetInstanceByID(ctx, instanceID)
+	_, err = cloud.GetInstanceByID(ctx, instanceID)
 	if err != nil {
 		if cpoerrors.IsNotFound(err) {
 			klog.V(3).Infof("ControllerUnpublishVolume assuming volume %s is detached, because node %s does not exist", volumeID, instanceID)
@@ -497,11 +531,9 @@ func (cs *controllerServer) ListVolumes(ctx context.Context, req *csi.ListVolume
 func (cs *controllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
 	klog.V(4).Infof("CreateSnapshot: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[CreateSnapshot] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	name := req.Name
@@ -753,11 +785,9 @@ func (cs *controllerServer) createBackup(ctx context.Context, cloud openstack.IO
 func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
 	klog.V(4).Infof("DeleteSnapshot: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[DeleteSnapshot] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	id := req.GetSnapshotId()
@@ -790,11 +820,9 @@ func (cs *controllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 }
 
 func (cs *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[DeleteSnapshot] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	snapshotID := req.GetSnapshotId()
@@ -830,7 +858,6 @@ func (cs *controllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnap
 	filters := map[string]string{}
 
 	var slist []snapshots.Snapshot
-	var err error
 	var nextPageToken string
 
 	// Add the filters
@@ -883,11 +910,9 @@ func (cs *controllerServer) ControllerGetCapabilities(ctx context.Context, req *
 }
 
 func (cs *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[ValidateVolumeCapabilities] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	reqVolCap := req.GetVolumeCapabilities()
@@ -901,7 +926,7 @@ func (cs *controllerServer) ValidateVolumeCapabilities(ctx context.Context, req 
 		return nil, status.Error(codes.InvalidArgument, "ValidateVolumeCapabilities Volume ID must be provided")
 	}
 
-	_, err := cloud.GetVolume(ctx, volumeID)
+	_, err = cloud.GetVolume(ctx, volumeID)
 	if err != nil {
 		if cpoerrors.IsNotFound(err) {
 			return nil, status.Errorf(codes.NotFound, "ValidateVolumeCapabilities Volume %s not found", volumeID)
@@ -977,11 +1002,9 @@ func (cs *controllerServer) ControllerGetVolume(ctx context.Context, req *csi.Co
 func (cs *controllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
 	klog.V(4).Infof("ControllerExpandVolume: called with args %+v", protosanitizer.StripSecrets(req))
 
-	// Volume cloud
-	volCloud := req.GetSecrets()["cloud"]
-	cloud, cloudExist := cs.Clouds[volCloud]
-	if !cloudExist {
-		return nil, status.Error(codes.InvalidArgument, "[ControllerExpandVolume] specified cloud undefined")
+	cloud, err := cs.getCloudFromSecrets(req.GetSecrets())
+	if err != nil {
+		return nil, err
 	}
 
 	volumeID := req.GetVolumeId()
